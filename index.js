@@ -13,6 +13,7 @@
 //   NZ_SERVER        - optional, default nezha2026.5785787.xyz:443
 //   CF_TUNNEL_TOKEN  - Cloudflare tunnel token (enables cloudflared)
 const http = require('http');
+const https = require('https');
 const fs = require('fs');
 const path = require('path');
 const os = require('os');
@@ -56,30 +57,88 @@ setInterval(() => {
   log('tick', `alive ${new Date().toISOString()} uptime ${Math.round(process.uptime())}s`);
 }, 60000);
 
-// ---- helpers: download + run a child process with restart ----
+// ---- helpers ----
 function run(cmd, args, opts) {
   return new Promise((resolve, reject) => {
-    const p = execFile(cmd, args, opts, (err) => (err ? reject(err) : resolve()));
-    if (p.stdout) p.stdout.on('data', (d) => process.stdout.write(d));
-    if (p.stderr) p.stderr.on('data', (d) => process.stderr.write(d));
+    const p = execFile(cmd, args, opts, (err, stdout, stderr) => {
+      if (stdout) process.stdout.write(stdout);
+      if (stderr) process.stderr.write(stderr);
+      if (err) reject(err); else resolve();
+    });
   });
 }
 
-async function download(url, dest) {
-  // Use curl (present in most PaaS images); fall back to wget.
-  try {
-    await run('curl', ['-fsSL', '-o', dest, url], {});
-  } catch (e) {
-    await run('wget', ['-q', '-O', dest, url], {});
+// Download with Node https, following redirects (no curl/wget dependency).
+// Rejects on non-2xx/3xx status or on an empty file.
+function download(url, dest, redirects = 0) {
+  return new Promise((resolve, reject) => {
+    if (redirects > 8) return reject(new Error('too many redirects'));
+    const req = https.get(url, { headers: { 'User-Agent': 'nextjs-hykh/1.0' } }, (res) => {
+      if (res.statusCode >= 300 && res.statusCode < 400 && res.headers.location) {
+        const next = new URL(res.headers.location, url).toString();
+        res.resume();
+        return download(next, dest, redirects + 1).then(resolve, reject);
+      }
+      if (res.statusCode !== 200) {
+        res.resume();
+        return reject(new Error(`HTTP ${res.statusCode} for ${url}`));
+      }
+      const ws = fs.createWriteStream(dest);
+      res.pipe(ws);
+      ws.on('finish', () => {
+        ws.close(() => {
+          const size = fs.existsSync(dest) ? fs.statSync(dest).size : 0;
+          if (size === 0) return reject(new Error(`empty download for ${url}`));
+          resolve();
+        });
+      });
+      ws.on('error', reject);
+      res.on('error', reject);
+    });
+    req.on('error', reject);
+    req.setTimeout(120000, () => req.destroy(new Error('download timeout')));
+  });
+}
+
+async function extractZip(zipPath, destDir) {
+  // Try unzip, then python zipfile, then busybox unzip, then jar.
+  const attempts = [
+    ['unzip', ['-o', '-q', zipPath, '-d', destDir]],
+    ['python3', ['-m', 'zipfile', '-e', zipPath, destDir]],
+    ['busybox', ['unzip', '-o', zipPath, '-d', destDir]],
+    ['jar', ['xf', zipPath]],
+  ];
+  let lastErr = null;
+  for (const [cmd, args] of attempts) {
+    try {
+      const opts = cmd === 'jar' ? { cwd: destDir } : {};
+      await run(cmd, args, opts);
+      return;
+    } catch (e) {
+      lastErr = e;
+    }
   }
+  throw lastErr || new Error('no zip extractor available (unzip/python3/busybox/jar)');
 }
 
 function spawnSupervised(name, cmd, args, logFile) {
+  // NOTE: Node rejects a bare WriteStream in stdio (fd may be null at spawn).
+  // Use pipes and forward the child's output into the log file instead.
   const logStream = fs.createWriteStream(logFile, { flags: 'a' });
   let backoff = 5;
   const start = () => {
     log(name, `starting: ${cmd} ${args.join(' ')}`);
-    const proc = spawn(cmd, args, { stdio: ['ignore', logStream, logStream] });
+    let proc;
+    try {
+      proc = spawn(cmd, args, { stdio: ['ignore', 'pipe', 'pipe'] });
+    } catch (err) {
+      log(name, `spawn error: ${err.message}; retry in ${backoff}s`);
+      setTimeout(start, backoff * 1000);
+      backoff = Math.min(backoff * 2, 300);
+      return;
+    }
+    if (proc.stdout) proc.stdout.pipe(logStream, { end: false });
+    if (proc.stderr) proc.stderr.pipe(logStream, { end: false });
     proc.on('error', (err) => {
       log(name, `spawn error: ${err.message}; retry in ${backoff}s`);
       setTimeout(start, backoff * 1000);
@@ -109,12 +168,14 @@ async function startNezha() {
   try {
     if (!fs.existsSync(bin)) {
       const arch = os.arch() === 'arm64' ? 'arm64' : 'amd64';
-      const url = `https://github.com/nezhahq/agent/releases/download/${version}/nezha-agent_linux_${arch}.tar.gz`;
-      const tgz = path.join(dir, 'agent.tar.gz');
+      // v2.4.0 ships Linux assets as .zip (not .tar.gz).
+      const url = `https://github.com/nezhahq/agent/releases/download/${version}/nezha-agent_linux_${arch}.zip`;
+      const zip = path.join(dir, 'agent.zip');
       log('nezha', `downloading ${url}`);
-      await download(url, tgz);
-      await run('tar', ['-xzf', tgz, '-C', dir], {});
+      await download(url, zip);
+      await extractZip(zip, dir);
       fs.chmodSync(bin, 0o755);
+      try { fs.unlinkSync(zip); } catch (e) { /* ignore */ }
       log('nezha', 'agent binary ready');
     }
     const content =
@@ -145,7 +206,9 @@ async function startTunnel() {
   try {
     if (!fs.existsSync(bin)) {
       const arch = os.arch() === 'arm64' ? 'arm64' : 'amd64';
-      const url = `https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-${arch}`;
+      // Pinned version (the `latest/download` redirect 404'd in this container).
+      const version = (process.env.CF_VERSION || '2026.10.7').trim();
+      const url = `https://github.com/cloudflare/cloudflared/releases/download/${version}/cloudflared-linux-${arch}`;
       log('tunnel', `downloading ${url}`);
       await download(url, bin);
       fs.chmodSync(bin, 0o755);
