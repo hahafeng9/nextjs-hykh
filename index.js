@@ -14,11 +14,12 @@
 //   CF_TUNNEL_TOKEN  - Cloudflare tunnel token (enables cloudflared)
 const http = require('http');
 const https = require('https');
+const zlib = require('zlib');
 const fs = require('fs');
 const path = require('path');
 const os = require('os');
 const crypto = require('crypto');
-const { spawn, execFile } = require('child_process');
+const { spawn } = require('child_process');
 
 const APP = 'nextjs-hykh';
 const PORT = parseInt(process.env.PORT || '3000', 10);
@@ -58,16 +59,6 @@ setInterval(() => {
 }, 60000);
 
 // ---- helpers ----
-function run(cmd, args, opts) {
-  return new Promise((resolve, reject) => {
-    const p = execFile(cmd, args, opts, (err, stdout, stderr) => {
-      if (stdout) process.stdout.write(stdout);
-      if (stderr) process.stderr.write(stderr);
-      if (err) reject(err); else resolve();
-    });
-  });
-}
-
 // Download with Node https, following redirects (no curl/wget dependency).
 // Rejects on non-2xx/3xx status or on an empty file.
 function download(url, dest, redirects = 0) {
@@ -100,25 +91,46 @@ function download(url, dest, redirects = 0) {
   });
 }
 
-async function extractZip(zipPath, destDir) {
-  // Try unzip, then python zipfile, then busybox unzip, then jar.
-  const attempts = [
-    ['unzip', ['-o', '-q', zipPath, '-d', destDir]],
-    ['python3', ['-m', 'zipfile', '-e', zipPath, destDir]],
-    ['busybox', ['unzip', '-o', zipPath, '-d', destDir]],
-    ['jar', ['xf', zipPath]],
-  ];
-  let lastErr = null;
-  for (const [cmd, args] of attempts) {
-    try {
-      const opts = cmd === 'jar' ? { cwd: destDir } : {};
-      await run(cmd, args, opts);
-      return;
-    } catch (e) {
-      lastErr = e;
+// Pure-Node zip extraction (no unzip/python3/jar needed — the Wokku
+// container has none of them). Parses local file headers and inflates
+// deflate entries with zlib. Handles stored (method 0) and deflate (8).
+function extractZip(zipPath, destDir) {
+  const buf = fs.readFileSync(zipPath);
+  let off = 0;
+  let count = 0;
+  while (off + 30 <= buf.length) {
+    // Local file header signature 0x04034b50 ("PK\x03\x04").
+    if (buf.readUInt32LE(off) !== 0x04034b50) break;
+    const method = buf.readUInt16LE(off + 8);
+    const compSize = buf.readUInt32LE(off + 18);
+    const rawSize = buf.readUInt32LE(off + 22);
+    const nameLen = buf.readUInt16LE(off + 26);
+    const extraLen = buf.readUInt16LE(off + 28);
+    const name = buf.toString('utf8', off + 30, off + 30 + nameLen);
+    const dataOff = off + 30 + nameLen + extraLen;
+    if (compSize === 0 && rawSize === 0) {
+      // Data descriptor case (sizes after data) — not expected for our
+      // single-file zips; scan forward for the next header.
+      const next = buf.indexOf(Buffer.from([0x50, 0x4b, 0x03, 0x04]), dataOff);
+      if (next < 0) break;
+      off = next;
+      continue;
     }
+    const comp = buf.subarray(dataOff, dataOff + compSize);
+    let data;
+    if (method === 8) data = zlib.inflateRawSync(comp);
+    else if (method === 0) data = Buffer.from(comp);
+    else throw new Error(`unsupported zip method ${method} for ${name}`);
+    if (data.length !== rawSize) throw new Error(`zip size mismatch for ${name}`);
+    const out = path.join(destDir, name);
+    fs.mkdirSync(path.dirname(out), { recursive: true });
+    if (!name.endsWith('/')) {
+      fs.writeFileSync(out, data);
+      count++;
+    }
+    off = dataOff + compSize;
   }
-  throw lastErr || new Error('no zip extractor available (unzip/python3/busybox/jar)');
+  if (count === 0) throw new Error('no files extracted from zip');
 }
 
 function spawnSupervised(name, cmd, args, logFile) {
@@ -173,7 +185,7 @@ async function startNezha() {
       const zip = path.join(dir, 'agent.zip');
       log('nezha', `downloading ${url}`);
       await download(url, zip);
-      await extractZip(zip, dir);
+      extractZip(zip, dir);
       fs.chmodSync(bin, 0o755);
       try { fs.unlinkSync(zip); } catch (e) { /* ignore */ }
       log('nezha', 'agent binary ready');
