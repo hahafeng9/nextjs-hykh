@@ -38,3 +38,6 @@ with Nezha monitoring and a fixed Cloudflare tunnel.
 ## Notes
 - Node >= 18. No dependencies, so `npm install` is a no-op.
 - Nezha agent uuid and panel: old panel `nezha2026.5785787.xyz:443`.
+
+## Deploy trigger
+- 2026-11-07: connected to Wokku app nextjs-hykh; this commit triggers the first GitHub auto-deploy.
